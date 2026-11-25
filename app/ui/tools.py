@@ -66,6 +66,18 @@ class SelectTool(BaseTool):
         self._dragging = False
 
     def mousePress(self, event) -> bool:
+        if event.button() == Qt.RightButton:
+            # POSE 关键点右键循环可见性：转发给命中关键点的形状；
+            # 未命中则不处理，留给画布的上下文菜单
+            pos = self._pos(event)
+            for shape in self.canvas.shapes:
+                if shape.label.type != LabelType.POSE:
+                    continue
+                h = shape.handle_at(pos)
+                if h and h.startswith("k"):
+                    shape.mousePressEvent(_ItemEvent(event, pos))
+                    return True
+            return False
         if event.button() != Qt.LeftButton:
             return False
         pos = self._pos(event)

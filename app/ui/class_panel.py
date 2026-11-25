@@ -23,8 +23,12 @@ def _color_icon(color: str, size: int = 14) -> QPixmap:
 class ClassPanel(QWidget):
     """左侧类别面板。"""
 
-    classes_changed = Signal(list)       # 类别名列表
+    classes_changed = Signal(list)       # 类别名列表（增/改名，不改变 id 语义）
     current_class_changed = Signal(int)  # 当前类别 id
+    # 删除/重排会改变既有标注的 class_id 语义，必须由主窗口确认并
+    # 重映射所有标注文件后回写面板，面板自身只发请求
+    class_delete_requested = Signal(int)   # 请求删除类别（索引）
+    class_move_requested = Signal(int, int)  # 请求交换两个类别（索引 i, j）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -144,29 +148,15 @@ class ClassPanel(QWidget):
     def _on_delete(self) -> None:
         if not self._classes:
             return
-        idx = self._current
-        name = self._classes[idx]
-        ret = QMessageBox.question(
-            self, "删除类别",
-            f"确定删除类别 '{name}' 吗？\n注意：该类别已有的标注将无法显示，建议先处理相关标注。",
-        )
-        if ret != QMessageBox.Yes:
-            return
-        del self._classes[idx]
-        self._current = min(self._current, len(self._classes) - 1) if self._classes else 0
-        self._refresh()
-        self.classes_changed.emit(self._classes)
-        self.current_class_changed.emit(self._current)
+        # 删除会改变后续类别的 class_id，需要主窗口重映射所有标注文件
+        self.class_delete_requested.emit(self._current)
 
     def _move(self, delta: int) -> None:
         i = self._current
         j = i + delta
         if 0 <= j < len(self._classes):
-            self._classes[i], self._classes[j] = self._classes[j], self._classes[i]
-            self._current = j
-            self._refresh()
-            self.classes_changed.emit(self._classes)
-            self.current_class_changed.emit(self._current)
+            # 交换两个类别会互换它们的 class_id 语义，需要主窗口重映射
+            self.class_move_requested.emit(i, j)
 
     # ---------- 事件 ----------
     def _on_row_changed(self, row: int) -> None:

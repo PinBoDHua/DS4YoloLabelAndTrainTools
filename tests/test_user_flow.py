@@ -1,9 +1,13 @@
 """标注序列回归测试：绘制→切图→关闭（使用独立临时数据集，绝不触碰用户数据）。"""
+import os
 import sys
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# 重定向配置到临时目录（必须在导入 app 模块前设置）
+os.environ["YOLO_LABEL_CONFIG"] = str(Path(tempfile.mkdtemp()) / "config.json")
 
 from PIL import Image
 

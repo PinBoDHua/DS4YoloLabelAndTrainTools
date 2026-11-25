@@ -33,32 +33,46 @@ def _looks_like_pose(values: list[float]) -> bool:
     return True
 
 
-def detect_format(values: list[float], prefer_type: LabelType | None = None) -> LabelType:
+def detect_format(values: list[float], prefer_type: LabelType | None = None) -> LabelType | None:
     """根据行 token 数自动识别标注类型。
 
     values 为 float 列表 [class, 其余值...]。
-    prefer_type 用于消除歧义：OBB 与 4 顶点分割多边形格式完全相同（8 个坐标），
-    此时以数据集声明的任务类型为准。
+    prefer_type 参与全部格式判断：
+      - 无 prefer_type 时按 token 数自动识别（n==8 的 OBB/4 顶点分割歧义默认按 OBB）；
+      - 给定 prefer_type（数据集声明的任务）时，行内容与该任务一致则按该任务解析，
+        不一致返回 None（调用方跳过该行并保留原始内容），避免损坏行被误读成其他任务。
     """
     n = len(values) - 1  # 去掉 class
+    if prefer_type is not None:
+        if prefer_type == LabelType.DETECT:
+            return LabelType.DETECT if n == 4 else None
+        if prefer_type == LabelType.OBB:
+            return LabelType.OBB if n == 8 else None
+        if prefer_type == LabelType.SEGMENT:
+            return LabelType.SEGMENT if n >= 6 and n % 2 == 0 else None
+        if prefer_type == LabelType.POSE:
+            return LabelType.POSE if _looks_like_pose(values) else None
+        return None
     if n == 4:
         return LabelType.DETECT
     if n == 8:
-        # 歧义：OBB 还是 4 顶点分割？优先数据集任务类型
-        if prefer_type in (LabelType.SEGMENT, LabelType.OBB):
-            return prefer_type
         return LabelType.OBB
     if _looks_like_pose(values):
         return LabelType.POSE
     if n >= 6 and n % 2 == 0:
         return LabelType.SEGMENT
-    return LabelType.SEGMENT  # 兜底
+    return None
 
 
 def read_yolo_txt(txt_path: str | Path, image_path: str | Path,
                   img_w: int | None = None, img_h: int | None = None,
                   prefer_type: LabelType | None = None) -> ImageAnnotation:
-    """读取单个 YOLO txt 为 ImageAnnotation。坐标统一转为绝对像素。"""
+    """读取单个 YOLO txt 为 ImageAnnotation。坐标统一转为绝对像素。
+
+    单行损坏（无法解析/与任务类型不符/坐标数不足）只跳过该行，
+    不终止整个文件；被跳过的行保存在 ann.raw_lines，写回时原样保留，
+    避免部分读取后自动保存把坏行静默清掉。
+    """
     txt_path = Path(txt_path)
     ann = ImageAnnotation(image_path=str(image_path))
     if not txt_path.exists():
@@ -67,20 +81,31 @@ def read_yolo_txt(txt_path: str | Path, image_path: str | Path,
         img_w, img_h = get_image_size(image_path)
 
     try:
-        for line in txt_path.read_text(encoding="utf-8").strip().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            tokens = line.split()
-            try:
-                values = [float(t) for t in tokens]
-            except ValueError:
-                logger.warning("跳过无法解析的行: %s -> %s", txt_path, line[:60])
-                continue
+        # errors="replace"：非 UTF-8 文件不至于整文件读取失败后被空内容覆盖
+        text = txt_path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        logger.warning("读取标注文件失败 %s: %s", txt_path, e)
+        return ann
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        tokens = line.split()
+        try:
+            values = [float(t) for t in tokens]
             class_id = int(values[0])
             rest = values[1:]
-            ltype = detect_format(values, prefer_type)
-
+        except ValueError:
+            logger.warning("跳过无法解析的行: %s -> %s", txt_path, line[:60])
+            ann.raw_lines.append(line)
+            continue
+        ltype = detect_format(values, prefer_type)
+        if ltype is None:
+            logger.warning("跳过与数据集任务不符的行: %s -> %s", txt_path, line[:60])
+            ann.raw_lines.append(line)
+            continue
+        try:
             if ltype == LabelType.DETECT:
                 cx, cy, w, h = rest
                 x1 = (cx - w / 2) * img_w
@@ -110,8 +135,9 @@ def read_yolo_txt(txt_path: str | Path, image_path: str | Path,
                 ann.labels.append(
                     LabelItem(ltype, class_id, points=[[x1, y1], [x2, y2]], keypoints=kpts)
                 )
-    except Exception as e:
-        logger.warning("读取标注文件失败 %s: %s", txt_path, e)
+        except (IndexError, ValueError) as e:
+            logger.warning("跳过坐标数不足的行: %s -> %s (%s)", txt_path, line[:60], e)
+            ann.raw_lines.append(line)
     return ann
 
 
@@ -120,7 +146,8 @@ def write_yolo_txt(ann: ImageAnnotation, txt_path: str | Path,
     """将 ImageAnnotation 写为 YOLO txt（归一化坐标）。"""
     txt_path = Path(txt_path)
     txt_path.parent.mkdir(parents=True, exist_ok=True)
-    if not ann.labels:
+    raw_lines = list(getattr(ann, "raw_lines", []) or [])
+    if not ann.labels and not raw_lines:
         # 无标注时写空文件（保留占位，表明该图已处理过）
         txt_path.write_text("", encoding="utf-8")
         return
@@ -155,7 +182,77 @@ def write_yolo_txt(ann: ImageAnnotation, txt_path: str | Path,
                           f"{min(max(ky / img_h, 0), 1):.6f}", str(int(v))]
         lines.append(" ".join(parts))
 
+    # 读取时无法解析的行原样写回，避免自动保存静默丢弃
+    lines.extend(raw_lines)
     txt_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
+def _parse_class_token(token: str) -> int | None:
+    try:
+        return int(token)
+    except ValueError:
+        try:
+            return int(float(token))
+        except ValueError:
+            return None
+
+
+def count_class_usage(labels_dir: str | Path) -> dict[int, int]:
+    """统计 labels 目录（含划分/嵌套子目录）各 class_id 的标注行数。"""
+    counts: dict[int, int] = {}
+    for f in Path(labels_dir).rglob("*.txt"):
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for line in text.splitlines():
+            tokens = line.strip().split()
+            if not tokens:
+                continue
+            cid = _parse_class_token(tokens[0])
+            if cid is not None:
+                counts[cid] = counts.get(cid, 0) + 1
+    return counts
+
+
+def remap_class_ids(labels_dir: str | Path,
+                    mapping: dict[int, int | None]) -> tuple[int, int]:
+    """按 mapping 重映射所有 label txt 的 class_id。
+
+    mapping: 旧 class_id -> 新 class_id；值为 None 表示删除该标注行。
+    只重写有变化的文件；未涉及的行保持原样（含空行/坏行）。
+    返回 (重写文件数, 删除行数)。
+    """
+    rewritten = removed = 0
+    for f in Path(labels_dir).rglob("*.txt"):
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            logger.warning("类别重映射跳过无法读取的文件 %s: %s", f, e)
+            continue
+        out: list[str] = []
+        changed = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                out.append(line)
+                continue
+            tokens = stripped.split()
+            cid = _parse_class_token(tokens[0]) if tokens else None
+            if cid is None or cid not in mapping:
+                out.append(line)
+                continue
+            new_id = mapping[cid]
+            if new_id is None:
+                changed = True
+                removed += 1
+                continue
+            out.append(" ".join([str(new_id)] + tokens[1:]))
+            changed = True
+        if changed:
+            f.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+            rewritten += 1
+    return rewritten, removed
 
 
 def label_path_for(image_path: str | Path, labels_dir: str | Path) -> Path:

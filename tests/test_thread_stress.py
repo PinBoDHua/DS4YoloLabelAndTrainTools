@@ -1,4 +1,5 @@
 """线程压力测试：反复重启缩略图线程 + 过滤切换 + 快速关闭（使用临时数据集）。"""
+import os
 import sys
 import tempfile
 import time
@@ -9,6 +10,10 @@ from types import SimpleNamespace
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+tmp = Path(tempfile.mkdtemp())
+# 重定向配置到临时目录（必须在导入 app 模块前设置）
+os.environ["YOLO_LABEL_CONFIG"] = str(tmp / "config.json")
 
 from PIL import Image
 
@@ -24,8 +29,6 @@ from app.ui.main_window import MainWindow
 from app.core.dataset_manager import create_dataset
 from app.core.label_data import LabelType
 
-tmp = Path(tempfile.mkdtemp())
-config._path = tmp / "config.json"
 app = QApplication(sys.argv)
 theme.apply(app, "light")
 

@@ -1,10 +1,11 @@
 # YOLO Label & Train Tool dependencies
 # torch/torchvision are installed separately from pytorch cu121 index (see setup.bat)
-PySide6>=6.6
-opencv-python>=4.8
-numpy>=1.24
-Pillow>=10.0
-pyqtgraph>=0.13
-ultralytics>=8.2
-tqdm>=4.65
-requests>=2.31
+# Upper bounds pin to major versions validated in this repo (see .venv)
+PySide6>=6.6,<7
+opencv-python>=4.8,<6
+numpy>=1.24,<3
+Pillow>=10.0,<13
+pyqtgraph>=0.13,<0.15
+ultralytics>=8.2,<9
+tqdm>=4.65,<5
+requests>=2.31,<3

@@ -64,18 +64,27 @@ class LabelItem:
 
 @dataclass
 class ImageAnnotation:
-    """一张图片的全部标注。"""
+    """一张图片的全部标注。
+
+    raw_lines 保存读取时无法解析的原始行（保持原样），写回时原样追加，
+    避免坏行被自动保存静默清除。
+    """
     image_path: str
     labels: list = field(default_factory=list)
+    raw_lines: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        return {"image_path": self.image_path, "labels": [l.to_dict() for l in self.labels]}
+        d = {"image_path": self.image_path, "labels": [l.to_dict() for l in self.labels]}
+        if self.raw_lines:
+            d["raw_lines"] = list(self.raw_lines)
+        return d
 
     @staticmethod
     def from_dict(d: dict) -> "ImageAnnotation":
         return ImageAnnotation(
             image_path=d["image_path"],
             labels=[LabelItem.from_dict(l) for l in d.get("labels", [])],
+            raw_lines=list(d.get("raw_lines", [])),
         )
 
 

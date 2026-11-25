@@ -1,10 +1,15 @@
 """对话框交互回归测试：自动填写并确认「新建数据集」对话框，验证无枚举兼容性错误。"""
+import os
 import sys
 import tempfile
 import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+tmp = Path(tempfile.mkdtemp())
+# 重定向配置到临时目录（必须在导入 app 模块前设置）
+os.environ["YOLO_LABEL_CONFIG"] = str(tmp / "config.json")
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QLineEdit,
@@ -17,8 +22,6 @@ from app.config import config
 from app.theme import theme
 from app.ui.main_window import MainWindow
 
-tmp = Path(tempfile.mkdtemp())
-config._path = tmp / "config.json"
 app = QApplication(sys.argv)
 theme.apply(app, "light")
 
@@ -26,6 +29,22 @@ win = MainWindow()
 win.show()
 
 result = {"created": False}
+failures: list[str] = []
+
+
+def record_fail(msg: str) -> None:
+    """记录失败：任何失败都必须反映到进程退出码。"""
+    print(f"[FAIL] {msg}")
+    failures.append(msg)
+
+
+def finish(exit_code: int) -> None:
+    code = 1 if failures else exit_code
+    if failures:
+        print(f"共 {len(failures)} 项失败:")
+        for f in failures:
+            print(f"  - {f}")
+    app.exit(code)
 
 
 def find_dialog():
@@ -44,8 +63,8 @@ def step1_open():
 def step2_fill():
     dlg = find_dialog()
     if dlg is None:
-        print("[FAIL] 对话框未打开")
-        app.exit(1)
+        record_fail("对话框未打开")
+        finish(1)
         return
     print(f"步骤 2: 找到对话框 {type(dlg).__name__}")
     # 填写目录与类别
@@ -58,14 +77,17 @@ def step2_fill():
 def step3_confirm():
     dlg = find_dialog()
     if dlg is None:
-        print("[FAIL] 对话框未找到")
-        app.exit(1)
+        record_fail("对话框未找到")
+        finish(1)
         return
     print("步骤 3: 点击确定")
     for btn in dlg.findChildren(QPushButton):
         if btn.text() in ("OK", "确定", "Ok"):
             btn.click()
             break
+    else:
+        record_fail("未找到确认按钮，对话框未提交")
+        finish(1)
 
 
 def verify_import_annotation_identity():
@@ -175,20 +197,19 @@ def step4_verify():
         print(f"[OK] 数据集创建成功: {meta}")
         result["created"] = True
     else:
-        print("[FAIL] 数据集未创建")
-        app.exit(1)
+        record_fail("数据集未创建")
+        finish(1)
         return
     if win.dataset is not None and win.dataset.meta.classes == ["cat", "dog", "bird"]:
         print("[OK] 主窗口已打开数据集，类别正确")
     else:
-        print(f"[FAIL] 主窗口状态异常: dataset={win.dataset}")
-        app.exit(1)
+        record_fail(f"主窗口状态异常: dataset={win.dataset}")
+        finish(1)
         return
     QTimer.singleShot(0, step5_regressions)
 
 
 def step5_regressions():
-    failed = False
     for verify in (verify_import_annotation_identity,
                    verify_prelabel_close_refreshes,
                    verify_empty_dataset_clears_annotation_identity):
@@ -196,17 +217,14 @@ def step5_regressions():
             verify()
         except Exception:
             traceback.print_exc()
-            failed = True
-    if failed:
-        app.exit(1)
-        return
-    print("对话框与标注归属回归测试完成")
-    app.quit()
+            record_fail(f"{verify.__name__} 失败")
+    print("对话框与标注归属回归测试完成" if not failures else "存在失败项")
+    finish(0)
 
 
 QTimer.singleShot(500, step1_open)
 QTimer.singleShot(1200, step2_fill)
 QTimer.singleShot(1600, step3_confirm)
 QTimer.singleShot(2600, step4_verify)
-QTimer.singleShot(15000, lambda: (print("[FAIL] 超时"), app.exit(1)))
+QTimer.singleShot(15000, lambda: (record_fail("超时"), finish(1)))
 sys.exit(app.exec())

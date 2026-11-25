@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -11,7 +12,9 @@ logger = logging.getLogger(__name__)
 ROOT_DIR = Path(__file__).resolve().parent.parent
 MODELS_DIR = ROOT_DIR / "models"
 LOGS_DIR = ROOT_DIR / "logs"
-CONFIG_FILE = ROOT_DIR / "config.json"
+# 测试可用 YOLO_LABEL_CONFIG 环境变量重定向配置文件路径（必须在导入前设置），
+# 避免写真实项目配置
+CONFIG_FILE = Path(os.environ.get("YOLO_LABEL_CONFIG", str(ROOT_DIR / "config.json")))
 
 # 图片过滤条件
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}

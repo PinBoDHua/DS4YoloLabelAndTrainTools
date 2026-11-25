@@ -14,9 +14,9 @@ from PySide6.QtWidgets import (QApplication, QDialog, QDockWidget, QFileDialog,
 from app.config import config
 from app.core.dataset_manager import Dataset, create_dataset
 from app.core.label_data import DatasetMeta, ImageAnnotation, LabelType
-from app.core.label_io import write_yolo_txt
+from app.core.label_io import count_class_usage, remap_class_ids, write_yolo_txt
 from app.theme import theme
-from app.ui.canvas import COCO_SKELETON, LabelCanvas
+from app.ui.canvas import COCO_SKELETON, LabelCanvas, class_color
 from app.ui.class_panel import ClassPanel
 from app.ui.image_panel import ImagePanel
 from app.ui.test_panel import TestPanel
@@ -84,6 +84,8 @@ class MainWindow(QMainWindow):
         self.image_panel.image_selected.connect(self._on_image_clicked)
         self.class_panel.current_class_changed.connect(self._on_class_changed)
         self.class_panel.classes_changed.connect(self._on_classes_changed)
+        self.class_panel.class_delete_requested.connect(self._on_class_delete_requested)
+        self.class_panel.class_move_requested.connect(self._on_class_move_requested)
         self.train_panel.running_changed.connect(self._on_train_running)
         self.train_panel.best_model_ready.connect(self.test_panel.set_model)
         self.welcome_page.new_dataset_requested.connect(self._new_dataset)
@@ -105,6 +107,11 @@ class MainWindow(QMainWindow):
 
     def _on_app_about_to_quit(self) -> None:
         """退出前停掉所有后台线程，避免线程运行时被销毁导致 C++ 层崩溃。"""
+        # app.quit() 等路径不经过 closeEvent，当前未保存编辑（自动保存关闭时）在此兜底
+        try:
+            self._save_current_annotation(quiet=True)
+        except Exception:
+            pass
         try:
             self._save_dataset_state()
         except Exception:
@@ -377,6 +384,15 @@ class MainWindow(QMainWindow):
             self._open_dataset(path)
 
     def _open_dataset(self, root: str, ds: Dataset | None = None) -> None:
+        # 训练进行中禁止切换：后台仍训练旧数据集，而训练面板已绑定新数据集，
+        # 状态不一致且线程销毁有崩溃风险
+        w = getattr(self.train_panel, "_worker", None)
+        if w is not None and w.isRunning():
+            QMessageBox.warning(
+                self, "训练进行中",
+                "训练正在进行中，请先到「训练」页点击「停止训练」后再切换数据集。",
+            )
+            return
         try:
             dataset = ds or Dataset(root)
         except Exception as e:
@@ -516,6 +532,11 @@ class MainWindow(QMainWindow):
         path = self.current_ann.image_path
         if not path:
             return
+        # 边界：current_ann 必须属于当前数据集（图片加载失败等场景下画布可能
+        # 仍显示旧数据集内容），否则会把旧数据集标注写进新数据集目录
+        if self.images and path not in self.images:
+            logger.warning("跳过跨数据集保存: %s 不属于 %s", path, self.dataset.root)
+            return
         ann = self.canvas.get_annotation()
         ann.image_path = path
         write_yolo_txt(ann, self.dataset.label_path(path))
@@ -587,7 +608,8 @@ class MainWindow(QMainWindow):
 
     def _on_class_changed(self, class_id: int) -> None:
         self.canvas.current_class_id = class_id
-        name = self.dataset.meta.classes[class_id] if self.dataset else "-"
+        name = (self.dataset.meta.classes[class_id]
+                if self.dataset and class_id < len(self.dataset.meta.classes) else "-")
         self.lb_class.setText(f"类别: {class_id} {name}")
 
     def _on_classes_changed(self, classes: list[str]) -> None:
@@ -596,15 +618,93 @@ class MainWindow(QMainWindow):
             self.dataset.save_meta()
             self.canvas.classes = classes
 
+    def _on_class_delete_requested(self, idx: int) -> None:
+        """删除类别：确认后重映射所有标注文件的 class_id，并删除该类标注。"""
+        if self.dataset is None:
+            return
+        classes = list(self.dataset.meta.classes)
+        if not (0 <= idx < len(classes)):
+            return
+        name = classes[idx]
+        usage = count_class_usage(self.dataset.labels_dir)
+        used = usage.get(idx, 0)
+        msg = f"确定删除类别 '{name}' 吗？"
+        if used:
+            msg += f"\n\n数据集中有 {used} 条该类别的标注，删除后这些标注将被一并移除。"
+        msg += "\n其后类别的编号会前移，所有标注文件将自动重映射。"
+        ret = QMessageBox.question(self, "删除类别", msg)
+        if ret != QMessageBox.Yes:
+            return
+        # 先保存画布，保证重映射基于最新标注
+        self._save_current_annotation(quiet=True)
+        mapping = {old: (old - 1 if old > idx else old)
+                   for old in range(len(classes)) if old != idx}
+        mapping[idx] = None
+        remap_class_ids(self.dataset.labels_dir, mapping)
+        del classes[idx]
+        self._apply_classes(classes, mapping,
+                            min(idx, len(classes) - 1) if classes else 0)
+        logger.info("已删除类别 '%s' 并重映射标注", name)
+
+    def _on_class_move_requested(self, old: int, new: int) -> None:
+        """上移/下移类别：交换两个类别的 id 语义并重映射所有标注。"""
+        if self.dataset is None:
+            return
+        classes = list(self.dataset.meta.classes)
+        if old == new or not (0 <= old < len(classes) and 0 <= new < len(classes)):
+            return
+        self._save_current_annotation(quiet=True)
+        mapping = {old: new, new: old}
+        remap_class_ids(self.dataset.labels_dir, mapping)
+        classes[old], classes[new] = classes[new], classes[old]
+        self._apply_classes(classes, mapping, new)
+        logger.info("已交换类别 %d/%d 并重映射标注", old, new)
+
+    def _apply_classes(self, classes: list[str], mapping: dict,
+                       current: int) -> None:
+        """类别删除/重排后同步元数据、画布标注与面板。"""
+        self.dataset.meta.classes = classes
+        self.dataset.save_meta()
+        self.canvas.classes = classes
+        # 画布当前标注同步重映射（先压撤销快照）
+        self._on_edit_begin()
+        removed = []
+        for s in self.canvas.shapes:
+            cid = s.label.class_id
+            if cid not in mapping:
+                continue
+            new_id = mapping[cid]
+            if new_id is None:
+                removed.append(s)
+            else:
+                s.label.class_id = new_id
+                s.color = class_color(new_id)
+                s.update()
+        for s in removed:
+            self.canvas.remove_shape_item(s)
+        self.class_panel.set_classes(
+            classes, max(0, min(current, len(classes) - 1)) if classes else 0)
+        self._labeled_cache = self.dataset.labeled_set()
+        for path in self.images:
+            self.image_panel.mark_labeled(path, path in self._labeled_cache)
+        self._update_progress_label()
+        if self.current_ann is not None:
+            self._on_labels_changed()
+
     def _on_shape_selected(self, item) -> None:
         if item is not None:
             cid = item.label.class_id
-            name = self.dataset.meta.classes[cid] if self.dataset and cid < len(self.dataset.meta.classes) else str(cid)
+            name = (self.dataset.meta.classes[cid]
+                    if self.dataset and cid < len(self.dataset.meta.classes) else str(cid))
             self.lb_class.setText(f"选中: {cid} {name}")
-        else:
+        elif self.dataset and self.dataset.meta.classes:
+            cid = self.canvas.current_class_id
+            if cid >= len(self.dataset.meta.classes):
+                cid = len(self.dataset.meta.classes) - 1
             self.lb_class.setText(
-                f"类别: {self.canvas.current_class_id} "
-                f"{self.dataset.meta.classes[self.canvas.current_class_id] if self.dataset else '-'}")
+                f"类别: {cid} {self.dataset.meta.classes[cid]}")
+        else:
+            self.lb_class.setText("类别: -")
 
     def _on_mouse_moved(self, pos) -> None:
         self.lb_pos.setText(f"坐标: ({int(pos.x())}, {int(pos.y())})")

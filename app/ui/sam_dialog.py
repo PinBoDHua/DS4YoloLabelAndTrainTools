@@ -36,8 +36,8 @@ class SamPreview(QWidget):
 
     def set_image(self, image_bgr: np.ndarray) -> None:
         self.image = image_bgr
+        # clear_hints 内部会重建像素图
         self.clear_hints()
-        self._update_pixmap()
         self.update()
 
     def clear_hints(self) -> None:
@@ -45,10 +45,13 @@ class SamPreview(QWidget):
         self.point_labels = []
         self.box = None
         self.mask_overlay = None
+        # 掩码烘焙在 _pixmap 里，必须重建才能清除显示
+        self._update_pixmap()
 
     def set_mask(self, mask: np.ndarray | None) -> None:
         self.mask_overlay = mask
-        self.update()
+        # 掩码在 _update_pixmap 中合成进 _pixmap，只 update() 不会生效
+        self._update_pixmap()
 
     def _update_pixmap(self) -> None:
         if self.image is None:
@@ -261,9 +264,15 @@ class SamDialog(QDialog):
             self.btn_add.setEnabled(True)
             self.lb_status.setText(f"分割完成（{len(polygon)} 个顶点）。可继续加点修正或添加标注")
         else:
+            # 新请求无结果：清空旧多边形/掩码，避免残留结果被误添加
+            self._last_poly = None
+            self.btn_add.setEnabled(False)
+            self.preview.set_mask(None)
             self.lb_status.setText("未检测到目标，请调整提示")
 
     def _clear_hints(self) -> None:
+        # 作废在途请求：否则其完成后 req_id 仍匹配，旧结果会重新出现
+        self._req_id += 1
         self.preview.clear_hints()
         self.btn_add.setEnabled(False)
         self._last_poly = None

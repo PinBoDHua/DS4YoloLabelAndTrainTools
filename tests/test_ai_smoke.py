@@ -14,11 +14,17 @@ from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer
 app = QCoreApplication(sys.argv)
 
 # 合成测试图：白底 + 两个不同颜色的圆
+# 放在临时数据集布局（images/ 与 labels/ 同级）中，与 PrelabelWorker 的
+# 路径约定一致（label 输出 = labels_dir / 相对 images_dir 的同名 txt）
+tmp = Path(tempfile.mkdtemp())
+img_dir = tmp / "images"
+img_dir.mkdir(parents=True)
 img = Image.new("RGB", (640, 480), "white")
 d = ImageDraw.Draw(img)
 d.ellipse([100, 100, 300, 300], fill=(255, 0, 0))     # 红圆
 d.ellipse([400, 200, 560, 420], fill=(0, 0, 255))     # 蓝圆
-img.save("_test_sam_input.png")
+img_path = img_dir / "_test_sam_input.png"
+img.save(img_path)
 bgr = np.asarray(img)[:, :, ::-1].copy()  # RGB -> BGR
 
 engine = SamEngine(None)
@@ -58,15 +64,14 @@ def test_prelabel():
     global _prelabel_worker  # 保持引用防止被 GC 回收
     from app.core.prelabel_engine import PrelabelWorker
     # 用 yolov8n.pt 对合成图推理（COCO 类别，红圆蓝圆可能检出为 sports ball）
-    tmp = Path(tempfile.mkdtemp())
-    _prelabel_worker = PrelabelWorker("yolov8n.pt", [str(Path("_test_sam_input.png").resolve())],
-                                      str(tmp), conf=0.1, skip_existing=False)
+    _prelabel_worker = PrelabelWorker("yolov8n.pt", [str(img_path)],
+                                      str(tmp / "labels"), conf=0.1, skip_existing=False)
     worker = _prelabel_worker
     result = {}
 
     def on_finish(ok, skip):
         result["ok"] = ok
-        out = tmp / "_test_sam_input.txt"
+        out = tmp / "labels" / "_test_sam_input.txt"
         if out.exists():
             lines = out.read_text(encoding="utf-8").strip().splitlines()
             print(f"[OK] 预标注完成: {ok} 张, 生成 {len(lines)} 个检测结果")

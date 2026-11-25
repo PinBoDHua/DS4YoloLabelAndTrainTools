@@ -1,9 +1,13 @@
 """GUI 冒烟测试：启动主窗口、切换主题、打开数据集，分阶段截图后自动退出。"""
+import os
 import sys
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# 重定向配置到临时目录：theme.apply / 主窗口状态都会写 config.json
+os.environ["YOLO_LABEL_CONFIG"] = str(Path(tempfile.mkdtemp()) / "config.json")
 
 from PIL import Image
 

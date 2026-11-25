@@ -80,7 +80,11 @@ def coco_to_yolo(json_path: str | Path, labels_out: str | Path,
     labels_out.mkdir(parents=True, exist_ok=True)
     data = json.loads(json_path.read_text(encoding="utf-8"))
 
-    classes = [c["name"] for c in data.get("categories", [])]
+    # COCO category_id 可为任意非连续整数（如 1/3/90），必须映射为
+    # 按 categories 顺序的连续 YOLO 索引，否则写出的 class 与类别表错位
+    categories = data.get("categories", [])
+    cat_index = {int(c["id"]): i for i, c in enumerate(categories)}
+    classes = [c["name"] for c in categories]
     images = {im["id"]: im for im in data.get("images", [])}
 
     ok = fail = 0
@@ -94,19 +98,16 @@ def coco_to_yolo(json_path: str | Path, labels_out: str | Path,
             w, h = im["width"], im["height"]
             lines = []
             for ann in anns_by_img.get(img_id, []):
-                cid = ann["category_id"]
-                if "segmentation" in ann and ann["segmentation"]:
-                    seg = ann["segmentation"]
-                    if isinstance(seg, list) and seg and isinstance(seg[0], list):
-                        pts = seg[0]  # 取最大轮廓的第一个多边形
-                    else:
-                        pts = seg
-                    if len(pts) >= 6:
-                        norm = [f"{v / w:.6f}" if i % 2 == 0 else f"{v / h:.6f}"
-                                for i, v in enumerate(pts)]
-                        lines.append(f"{cid} " + " ".join(norm))
-                        continue
-                if "keypoints" in ann and ann["keypoints"]:
+                try:
+                    cid = cat_index.get(int(ann["category_id"]))
+                except (KeyError, TypeError, ValueError):
+                    cid = None
+                if cid is None:
+                    logger.warning("跳过未知 category_id: %s", ann.get("category_id"))
+                    continue
+                # 关键点优先：同时含分割与关键点的姿态标注按 POSE 输出
+                # （box + kpts），若先走分割分支会丢失关键点
+                if ann.get("keypoints"):
                     kpts = ann["keypoints"]
                     x1, y1, bw, bh = ann["bbox"]
                     cx = (x1 + bw / 2) / w
@@ -119,6 +120,17 @@ def coco_to_yolo(json_path: str | Path, labels_out: str | Path,
                         f"{cid} {cx:.6f} {cy:.6f} {bw / w:.6f} {bh / h:.6f} " + " ".join(norm_k)
                     )
                     continue
+                if ann.get("segmentation"):
+                    seg = ann["segmentation"]
+                    if isinstance(seg, list) and seg and isinstance(seg[0], list):
+                        pts = seg[0]  # 取最大轮廓的第一个多边形
+                    else:
+                        pts = seg
+                    if isinstance(pts, list) and len(pts) >= 6:
+                        norm = [f"{v / w:.6f}" if i % 2 == 0 else f"{v / h:.6f}"
+                                for i, v in enumerate(pts)]
+                        lines.append(f"{cid} " + " ".join(norm))
+                        continue
                 # 检测框
                 x1, y1, bw, bh = ann["bbox"]
                 lines.append(

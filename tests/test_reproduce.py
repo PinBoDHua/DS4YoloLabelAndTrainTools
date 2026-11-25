@@ -3,10 +3,14 @@
 模拟：打开数据集 → 绘制矩形框 → 保存 → 编辑拖动 → 删除 → 撤销 → 切图 → 缩略图加载。
 """
 import sys
+import os
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# 重定向配置到临时目录（必须在导入 app 模块前设置）
+os.environ["YOLO_LABEL_CONFIG"] = str(Path(tempfile.mkdtemp()) / "config.json")
 
 from PIL import Image, ImageDraw
 

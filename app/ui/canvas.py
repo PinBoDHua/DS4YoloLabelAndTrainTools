@@ -158,24 +158,27 @@ class ShapeItem(QGraphicsItem):
                 k = self.label.keypoints[idx]
                 self.label.keypoints[idx] = [pos.x(), pos.y(), k[2]]
         elif hid == "rot":
-            # 绕 OBB 中心旋转
-            cx = sum(p[0] for p in self.label.points) / len(self.label.points)
-            cy = sum(p[1] for p in self.label.points) / len(self.label.points)
+            # 绕 OBB 中心旋转：以旋转手柄当前朝向为基准，对齐鼠标方向
             import math
-            a1 = math.atan2(pos.y() - cy, pos.x() - cx)
-            # 当前旋转角（以第一个顶点方向为基准）
-            p0 = self.label.points[0]
-            a0 = math.atan2(p0[1] - cy, p0[0] - cx)
-            da = a1 - a0
-            # 上方中点手柄代表 -90 方向，修正基准
-            da += math.pi / 2
-            pts = []
-            for x, y in self.label.points:
-                dx, dy = x - cx, y - cy
-                nx = cx + dx * math.cos(da) - dy * math.sin(da)
-                ny = cy + dx * math.sin(da) + dy * math.cos(da)
-                pts.append([nx, ny])
-            self.label.points = pts
+            pts = self.label.points
+            cx = sum(p[0] for p in pts) / len(pts)
+            cy = sum(p[1] for p in pts) / len(pts)
+            # 与 handles() 中 "rot" 的位置计算保持一致（上边缘中点外延 24px）
+            top = ((pts[0][0] + pts[1][0]) / 2, (pts[0][1] + pts[1][1]) / 2)
+            bottom = ((pts[2][0] + pts[3][0]) / 2, (pts[2][1] + pts[3][1]) / 2)
+            dx, dy = bottom[0] - top[0], bottom[1] - top[1]
+            ln = (dx * dx + dy * dy) ** 0.5 or 1.0
+            hx = top[0] - dx / ln * 24.0 - cx
+            hy = top[1] - dy / ln * 24.0 - cy
+            a_cur = math.atan2(hy, hx)
+            a_new = math.atan2(pos.y() - cy, pos.x() - cx)
+            da = a_new - a_cur
+            cos_d, sin_d = math.cos(da), math.sin(da)
+            self.label.points = [
+                [cx + (x - cx) * cos_d - (y - cy) * sin_d,
+                 cy + (x - cx) * sin_d + (y - cy) * cos_d]
+                for x, y in pts
+            ]
         self.prepareGeometryChange()
         self.update()
 
@@ -325,9 +328,10 @@ class ShapeItem(QGraphicsItem):
             if h and h.startswith("k"):
                 idx = int(h[1:])
                 k = self.label.keypoints[idx]
-                k[2] = 2 if k[2] != 2 else 1
+                # 先压撤销快照再修改，否则快照里已是改后状态，无法撤销
                 if self.on_edit_begin:
                     self.on_edit_begin()
+                k[2] = 2 if k[2] != 2 else 1
                 if self.on_edited:
                     self.on_edited()
                 self.update()
@@ -551,9 +555,11 @@ class LabelCanvas(QGraphicsView):
         self.scene.removeItem(item)
 
     def get_annotation(self) -> ImageAnnotation:
-        """从当前画布收集标注。"""
-        ann = ImageAnnotation(image_path=getattr(self, "current_ann", None) and
-                              self.current_ann.image_path or "")
+        """从当前画布收集标注（保留读取时未解析的原始行，避免保存时丢弃）。"""
+        cur = getattr(self, "current_ann", None)
+        ann = ImageAnnotation(image_path=(cur.image_path if cur else "") or "")
+        if cur is not None:
+            ann.raw_lines = list(getattr(cur, "raw_lines", []) or [])
         for s in self.shapes:
             ann.labels.append(s.label)
         return ann
@@ -689,7 +695,10 @@ class LabelCanvas(QGraphicsView):
             event.accept()
             return
         if self.tool is not None:
-            self.tool.mousePress(event)
+            if self.tool.mousePress(event):
+                # 工具已处理（如 POSE 关键点右键循环），不再传递
+                event.accept()
+                return
         else:
             super().mousePressEvent(event)
 

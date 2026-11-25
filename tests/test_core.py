@@ -13,7 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from PIL import Image
 
 from app.core.label_data import ImageAnnotation, LabelItem, LabelType
-from app.core.label_io import read_yolo_txt, write_yolo_txt
+from app.core.label_io import (read_yolo_txt, write_yolo_txt, detect_format,
+                               remap_class_ids, count_class_usage)
 from app.core.dataset_manager import Dataset, create_dataset
 from app.core.prelabel_engine import PrelabelWorker
 
@@ -271,6 +272,151 @@ def test_prelabel_extraction():
     print("  [OK] POSE YAML 与 OBB/POSE 预标注提取")
 
 
+def test_detect_format_prefer():
+    """数据集声明的任务类型必须参与全部格式判断。"""
+    # DETECT 数据集：非 4 值行应判为不符（None），不能兜底成 SEGMENT
+    assert detect_format([0, 0.5, 0.5, 0.2, 0.3, 0.1], LabelType.DETECT) is None
+    assert detect_format([0, 0.5, 0.5, 0.2, 0.3, 0.1, 0.4, 0.2], LabelType.DETECT) is None
+    assert detect_format([0, 0.5, 0.5, 0.2, 0.3, 0.1], None) is None  # 奇数坐标也不应兜底
+    # SEGMENT 数据集：8 值行按声明的 SEGMENT 解析（OBB/分割歧义消歧）
+    vals8 = [0] + [0.1] * 8
+    assert detect_format(vals8, LabelType.SEGMENT) == LabelType.SEGMENT
+    assert detect_format(vals8, LabelType.OBB) == LabelType.OBB
+    assert detect_format(vals8, None) == LabelType.OBB
+    # POSE 数据集：可见性不符合 0/1/2 的行判为不符
+    pose_bad = [0, 0.5, 0.5, 0.2, 0.3, 0.1, 0.2, 1.5]
+    assert detect_format(pose_bad, LabelType.POSE) is None
+    pose_ok = [0, 0.5, 0.5, 0.2, 0.3, 0.1, 0.2, 2.0]
+    assert detect_format(pose_ok, LabelType.POSE) == LabelType.POSE
+    print("  [OK] prefer_type 参与全部格式判断")
+
+
+def test_read_bad_lines_preserved():
+    """坏行只跳过不终止整个文件；且写回时原样保留，不被自动保存覆盖。"""
+    tmp = Path(tempfile.mkdtemp())
+    img = tmp / "bad.png"
+    make_test_image(img)
+
+    txt = tmp / "bad.txt"
+    # 第 1 行正常、第 2 行无法解析、第 3 行坐标数不足、第 4 行正常
+    txt.write_text(
+        "0 0.5 0.5 0.2 0.2\n"
+        "garbage line here\n"
+        "0 0.5 0.5\n"
+        "1 0.3 0.3 0.1 0.1\n",
+        encoding="utf-8")
+    ann = read_yolo_txt(txt, img, prefer_type=LabelType.DETECT)
+    assert len(ann.labels) == 2, f"好行应全部读出，实际 {len(ann.labels)}"
+    assert ann.labels[0].class_id == 0 and ann.labels[1].class_id == 1
+    assert len(ann.raw_lines) == 2, f"坏行应保留在 raw_lines，实际 {ann.raw_lines}"
+    # 旧实现：第 3 行 IndexError 会终止整个文件读取（只剩第 1 行）
+
+    # 自动保存（写回）不应丢弃坏行
+    write_yolo_txt(ann, txt)
+    text = txt.read_text(encoding="utf-8")
+    assert "garbage line here" in text, "写回后坏行丢失"
+    assert "0 0.5 0.5" in text, "写回后坐标数不足的行丢失"
+    # 再读一遍应稳定（幂等）
+    ann2 = read_yolo_txt(txt, img, prefer_type=LabelType.DETECT)
+    assert len(ann2.labels) == 2 and len(ann2.raw_lines) == 2
+
+    # 任务类型不符的行也应保留
+    txt2 = tmp / "mismatch.txt"
+    txt2.write_text("0 0.1 0.1 0.2 0.2 0.3 0.3 0.4 0.4 0.5 0.5\n", encoding="utf-8")
+    ann3 = read_yolo_txt(txt2, img, prefer_type=LabelType.DETECT)
+    assert not ann3.labels and len(ann3.raw_lines) == 1, "DETECT 数据集中的多边形行应被保留"
+    # 撤销快照 JSON 往返保留 raw_lines
+    ann4 = ImageAnnotation.from_dict(ann.to_dict())
+    assert ann4.raw_lines == ann.raw_lines
+    print("  [OK] 坏行逐行容错且写回保留")
+
+
+def test_coco_to_yolo():
+    """COCO 转换：category_id 映射为连续索引；分割+关键点标注保留关键点。"""
+    import json as json_mod
+    from app.core.format_convert import coco_to_yolo
+    tmp = Path(tempfile.mkdtemp())
+    coco = {
+        "categories": [
+            {"id": 12, "name": "cat"},
+            {"id": 90, "name": "dog"},
+            {"id": 3, "name": "person"},
+        ],
+        "images": [{"id": 1, "width": 100, "height": 100, "file_name": "a.jpg"}],
+        "annotations": [
+            # 非连续 id：cat=12 应映射为 0
+            {"image_id": 1, "category_id": 12, "bbox": [10, 10, 20, 20]},
+            # dog=90 → 1：同时含分割与关键点，应输出 pose 行（保留关键点）
+            {"image_id": 1, "category_id": 90, "bbox": [30, 30, 40, 40],
+             "segmentation": [[40.0, 40.0, 60.0, 40.0, 60.0, 60.0, 40.0, 60.0]],
+             "keypoints": [50.0, 50.0, 2, 55.0, 55.0, 1, 60.0, 60.0, 0]},
+            # person=3 → 2：纯分割
+            {"image_id": 1, "category_id": 3, "bbox": [0, 0, 10, 10],
+             "segmentation": [[1.0, 1.0, 5.0, 1.0, 5.0, 5.0, 1.0, 5.0]]},
+            # 未知类别应被跳过
+            {"image_id": 1, "category_id": 999, "bbox": [0, 0, 5, 5]},
+        ],
+    }
+    json_path = tmp / "coco.json"
+    json_path.write_text(json_mod.dumps(coco), encoding="utf-8")
+    out_dir = tmp / "yolo_labels"
+    ok, fail, classes = coco_to_yolo(json_path, out_dir)
+    assert ok == 1 and fail == 0
+    assert classes == ["cat", "dog", "person"]
+    lines = (out_dir / "a.txt").read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 3, f"未知类别应被跳过，实际 {len(lines)} 行"
+    # cat: 索引 0，检测行
+    assert lines[0].startswith("0 ")
+    # dog: 索引 1，pose 行 = 1 + box(4) + 3*3 关键点 = 14 个 token
+    dog_tokens = lines[1].split()
+    assert dog_tokens[0] == "1" and len(dog_tokens) == 14, \
+        f"分割+关键点标注应输出关键点，实际 {len(dog_tokens)} token"
+    assert dog_tokens[7] == "2" and dog_tokens[10] == "1" and dog_tokens[13] == "0", \
+        "关键点可见性错误"
+    # person: 索引 2，分割行
+    person_tokens = lines[2].split()
+    assert person_tokens[0] == "2" and len(person_tokens) == 9
+    print("  [OK] COCO 类别映射 + 关键点保留")
+
+
+def test_remap_class_ids():
+    """类别删除/重排必须重映射所有标注文件的 class_id。"""
+    tmp = Path(tempfile.mkdtemp())
+    labels = tmp / "labels"
+    (labels / "sub").mkdir(parents=True)
+    (labels / "a.txt").write_text(
+        "0 0.1 0.1 0.2 0.2\n1 0.3 0.3 0.2 0.2\n2 0.5 0.5 0.2 0.2\n",
+        encoding="utf-8")
+    (labels / "sub" / "b.txt").write_text(
+        "0 0.1 0.1 0.2 0.2\n1 0.3 0.3 0.2 0.2\ngarbage\n", encoding="utf-8")
+
+    usage = count_class_usage(labels)
+    assert usage == {0: 2, 1: 2, 2: 1}, f"类别统计错误: {usage}"
+
+    # 删除类别 1：其行删除，id>1 的前移
+    rewritten, removed = remap_class_ids(labels, {1: None, 2: 1})
+    assert removed == 2 and rewritten == 2
+    a_lines = (labels / "a.txt").read_text(encoding="utf-8").strip().splitlines()
+    assert a_lines[0].startswith("0 ") and a_lines[1].startswith("1 ")
+    assert len(a_lines) == 2, "被删除类别的行应移除"
+    b_text = (labels / "sub" / "b.txt").read_text(encoding="utf-8")
+    assert b_text.strip().splitlines()[0].startswith("0 "), "未受影响文件的行不应变化"
+    assert "garbage" in b_text, "坏行必须原样保留"
+
+    # 交换 0/1（上移/下移）
+    (labels / "a.txt").write_text(
+        "0 0.1 0.1 0.2 0.2\n1 0.3 0.3 0.2 0.2\n", encoding="utf-8")
+    remap_class_ids(labels, {0: 1, 1: 0})
+    a_lines = (labels / "a.txt").read_text(encoding="utf-8").strip().splitlines()
+    assert a_lines[0].startswith("1 ") and a_lines[1].startswith("0 "), "交换重映射错误"
+
+    # 删除最后一个类别（数据集仅剩 0 号类）
+    (labels / "a.txt").write_text("0 0.1 0.1 0.2 0.2\n", encoding="utf-8")
+    remap_class_ids(labels, {0: None})
+    assert (labels / "a.txt").read_text(encoding="utf-8") == "", "删除唯一类别后应清空"
+    print("  [OK] 类别删除/重排重映射")
+
+
 if __name__ == "__main__":
     print("== 测试 label_io 四种格式 ==")
     test_label_io()
@@ -285,4 +431,9 @@ if __name__ == "__main__":
     test_pose_yaml()
     test_prelabel_extraction()
     test_prelabel_preserves_nested_paths()
+    print("== 测试格式判断/坏行/COCO/类别重映射 ==")
+    test_detect_format_prefer()
+    test_read_bad_lines_preserved()
+    test_coco_to_yolo()
+    test_remap_class_ids()
     print("\n全部核心逻辑测试通过！")
